@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import { Client, Events, GatewayIntentBits } from 'discord.js';
+import { getSupabaseClient } from './lib/supabaseClient.js';
+import { subscribeToCommands } from './commands/subscribeToCommands.js';
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -16,6 +18,10 @@ const client = new Client({
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+
+  const supabase = getSupabaseClient();
+  subscribeToCommands(supabase);
+  console.log('Subscribed to bot_commands');
 });
 
 await client.login(token);
