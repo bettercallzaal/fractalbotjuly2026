@@ -75,4 +75,83 @@ describe('dispatchCommand', () => {
       expect.objectContaining({ method: 'POST' }),
     );
   });
+
+  it('rejects when the HTTP fallback fetch fails', async () => {
+    const supabase = {
+      from: () => ({
+        insert: () => ({
+          select: () => ({
+            single: async () => ({ data: { id: 'row-1', idempotency_key: 'k3' }, error: null }),
+          }),
+        }),
+        select: () => ({
+          eq: () => ({
+            single: async () => ({ data: { status: 'pending' }, error: null }),
+          }),
+        }),
+      }),
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('bot unreachable');
+    }));
+
+    await expect(
+      dispatchCommand(
+        supabase as any,
+        'randomize',
+        { memberIds: ['a'], maxGroupSize: 6 },
+        'admin-1',
+        'http://bot:8080',
+        'secret',
+        { pollIntervalMs: 1, timeoutMs: 5, fetchTimeoutMs: 100 },
+      ),
+    ).rejects.toThrow('bot unreachable');
+
+    expect(fetch).toHaveBeenCalled();
+  });
+
+  it('rejects when the HTTP fallback fetch times out', async () => {
+    const supabase = {
+      from: () => ({
+        insert: () => ({
+          select: () => ({
+            single: async () => ({ data: { id: 'row-1', idempotency_key: 'k4' }, error: null }),
+          }),
+        }),
+        select: () => ({
+          eq: () => ({
+            single: async () => ({ data: { status: 'pending' }, error: null }),
+          }),
+        }),
+      }),
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string, options: any) => {
+      const signal = options.signal as AbortSignal;
+      return new Promise((_, reject) => {
+        const onAbort = () => {
+          signal.removeEventListener('abort', onAbort);
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        };
+        if (signal) {
+          signal.addEventListener('abort', onAbort);
+        }
+      });
+    }));
+
+    await expect(
+      dispatchCommand(
+        supabase as any,
+        'randomize',
+        { memberIds: ['a'], maxGroupSize: 6 },
+        'admin-1',
+        'http://bot:8080',
+        'secret',
+        { pollIntervalMs: 1, timeoutMs: 5, fetchTimeoutMs: 20 },
+      ),
+    ).rejects.toThrow('The operation was aborted.');
+
+    expect(fetch).toHaveBeenCalled();
+  });
 });

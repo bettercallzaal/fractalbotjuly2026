@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 interface DispatchOptions {
   pollIntervalMs?: number;
   timeoutMs?: number;
+  fetchTimeoutMs?: number;
 }
 
 /** Inserts a command into the bot_commands queue, polls for the bot to ack
@@ -22,6 +23,7 @@ export async function dispatchCommand(
 ) {
   const pollIntervalMs = options.pollIntervalMs ?? 500;
   const timeoutMs = options.timeoutMs ?? 10_000;
+  const fetchTimeoutMs = options.fetchTimeoutMs ?? 10_000;
 
   const idempotencyKey = randomUUID();
 
@@ -46,11 +48,19 @@ export async function dispatchCommand(
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 
-  const response = await fetch(`${botApiUrl}/commands/${action}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-bot-api-secret': botApiSecret },
-    body: JSON.stringify({ params, idempotencyKey, requestedBy }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), fetchTimeoutMs);
 
-  return response.json();
+  try {
+    const response = await fetch(`${botApiUrl}/commands/${action}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bot-api-secret': botApiSecret },
+      body: JSON.stringify({ params, idempotencyKey, requestedBy }),
+      signal: controller.signal,
+    });
+
+    return response.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }

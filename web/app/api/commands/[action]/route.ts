@@ -15,17 +15,28 @@ export async function POST(req: NextRequest, { params }: { params: { action: str
     return NextResponse.json({ error: 'forbidden' }, { status: 403 });
   }
 
-  const body = await req.json();
+  let body;
+  try {
+    body = await req.json();
+  } catch (error) {
+    console.error('Failed to parse request body:', error);
+    return NextResponse.json({ error: 'invalid request body' }, { status: 400 });
+  }
+
   const supabase = getSupabaseClient();
 
-  const result = await dispatchCommand(
-    supabase,
-    params.action,
-    body.params ?? {},
-    session.discordId,
-    process.env.BOT_API_URL!,
-    process.env.BOT_API_SECRET!,
-  );
-
-  return NextResponse.json(result);
+  try {
+    const result = await dispatchCommand(
+      supabase,
+      params.action,
+      body.params ?? {},
+      session.discordId,
+      process.env.BOT_API_URL!,
+      process.env.BOT_API_SECRET!,
+    );
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error('Failed to dispatch command:', error);
+    return NextResponse.json({ error: 'command failed' }, { status: 500 });
+  }
 }
