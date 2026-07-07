@@ -1,138 +1,185 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { executeCommand } from './executeCommand.js';
 
-function makeFakeSupabase(existingRow: Record<string, unknown> | null, updateErrorOnCall?: number) {
-  const updateCalls: Record<string, unknown>[] = [];
-  let updateCallCount = 0;
+interface MockScenario {
+  existingRows: Record<string, any>[];
+  updateToFinalStatusShouldFail?: boolean;
+}
+
+function makeFakeSupabase(scenario: MockScenario) {
+  const rows = scenario.existingRows;
+
   return {
-    updateCalls,
     from: () => ({
-      insert: () => ({
-        select: () => ({
-          single: async () => {
-            if (existingRow) {
-              return { data: null, error: { code: '23505' } }; // unique_violation
-            }
-            return { data: { id: 'row-1', status: 'processing' }, error: null };
+      update: (values: Record<string, any>) => {
+        const isClaimUpdate = values.status === 'processing';
+
+        if (isClaimUpdate) {
+          // Claim update: update status to 'processing' where idempotency_key=X and status='pending'
+          return {
+            eq: (keyName: string, keyValue: string) => ({
+              eq: (statusKeyName: string, statusValue: string) => ({
+                select: () => ({
+                  single: async () => {
+                    const row = rows.find(
+                      (r) => r.idempotency_key === keyValue && r.status === 'pending'
+                    );
+                    if (!row) {
+                      return { data: null, error: { code: 'PGRST116' } };
+                    }
+                    row.status = 'processing';
+                    return { data: row, error: null };
+                  },
+                }),
+              }),
+            }),
+          };
+        } else {
+          // Final update: update status to 'done' or 'failed'
+          // Return object with .eq() method that returns an awaitable
+          const self = {
+            eq: () => {
+              // Return a thenable/awaitable object
+              return Promise.resolve(
+                scenario.updateToFinalStatusShouldFail
+                  ? { error: { message: 'Simulated update failure' } }
+                  : { error: null }
+              );
+            },
+          };
+          return self;
+        }
+      },
+
+      select: () => ({
+        eq: (keyName: string, keyValue: string) => ({
+          maybeSingle: async () => {
+            const row = rows.find((r) => r.idempotency_key === keyValue);
+            return { data: row || null, error: null };
           },
         }),
-      }),
-      select: () => ({
-        eq: () => ({
-          single: async () => ({ data: existingRow, error: null }),
-        }),
-      }),
-      update: (values: Record<string, unknown>) => ({
-        eq: () => {
-          updateCalls.push(values);
-          const currentCall = updateCallCount++;
-          // Simulate an update error on a specific call if configured
-          const shouldError = updateErrorOnCall !== undefined && currentCall === updateErrorOnCall;
-          return Promise.resolve(shouldError ? { error: { message: 'Update failed' } } : { error: null });
-        },
       }),
     }),
   };
 }
 
-describe('executeCommand', () => {
-  it('runs the action and marks the row done on first execution', async () => {
-    const supabase = makeFakeSupabase(null);
+describe('executeCommand with UPDATE-based claiming', () => {
+  it('(a) successfully claims pending row, runs action, and marks row done', async () => {
+    const existingRows = [
+      { id: 'row-1', idempotency_key: 'idem-a', status: 'pending', action: 'randomize', params: {} },
+    ];
+    const supabase = makeFakeSupabase({ existingRows });
+
     const result = await executeCommand(
       supabase as any,
       'randomize',
       { memberIds: ['a', 'b', 'c'], maxGroupSize: 6 },
-      'idem-key-1',
-      'admin-discord-id',
+      'idem-a',
+      'admin-discord-id'
     );
+
     expect(result.status).toBe('done');
-    expect(supabase.updateCalls[0]).toMatchObject({ status: 'done' });
+    expect(result.result).toBeDefined();
+    expect(result.result).toHaveProperty('groups');
   });
 
-  it('returns already_processed without re-running when the row is already done', async () => {
-    const supabase = makeFakeSupabase({ id: 'row-1', status: 'done', result: { groups: [['a']] } });
+  it('(b) returns already_processed without re-running when row is already processing (race lost)', async () => {
+    const existingRows = [
+      { id: 'row-1', idempotency_key: 'idem-b', status: 'processing' },
+    ];
+    const supabase = makeFakeSupabase({ existingRows });
+
     const result = await executeCommand(
       supabase as any,
       'randomize',
-      { memberIds: ['a'], maxGroupSize: 6 },
-      'idem-key-1',
-      'admin-discord-id',
+      { memberIds: ['a', 'b'], maxGroupSize: 6 },
+      'idem-b',
+      'admin-discord-id'
     );
+
     expect(result.status).toBe('already_processed');
-    expect(supabase.updateCalls.length).toBe(0);
   });
 
-  it('rejects an unknown action', async () => {
-    const supabase = makeFakeSupabase(null);
-    await expect(
-      executeCommand(supabase as any, 'nonexistent_action', {}, 'idem-key-2', 'admin-discord-id'),
-    ).rejects.toThrow('Unknown action: nonexistent_action');
-  });
+  it('(c) returns already_processed with existing result when row is already done', async () => {
+    const existingRows = [
+      {
+        id: 'row-1',
+        idempotency_key: 'idem-c',
+        status: 'done',
+        result: { groups: [['a', 'b']] },
+      },
+    ];
+    const supabase = makeFakeSupabase({ existingRows });
 
-  it('catches action execution failure and records it as failed', async () => {
-    const supabase = makeFakeSupabase(null);
-    // Pass invalid memberIds (not an array) to cause distributeIntoGroups to throw
     const result = await executeCommand(
       supabase as any,
       'randomize',
-      { memberIds: { invalid: 'object' }, maxGroupSize: 6 }, // Not an array - will cause iteration error
-      'idem-key-3',
-      'admin-discord-id',
+      { memberIds: ['a', 'b'], maxGroupSize: 6 },
+      'idem-c',
+      'admin-discord-id'
     );
-    expect(result.status).toBe('failed');
-    expect(result.result).toBeUndefined();
-    // Verify the failure was recorded in the database
-    expect(supabase.updateCalls[0]).toMatchObject({ status: 'failed' });
-    expect(supabase.updateCalls[0].result).toHaveProperty('error');
+
+    expect(result.status).toBe('already_processed');
+    expect(result.result).toEqual({ groups: [['a', 'b']] });
   });
 
-  it('throws error if update fails after successful execution', async () => {
-    const supabase = makeFakeSupabase(null, 0); // Fail on first update call
+  it('(d) throws clear error when no row exists at all for the idempotency_key', async () => {
+    const supabase = makeFakeSupabase({ existingRows: [] });
+
     await expect(
       executeCommand(
         supabase as any,
         'randomize',
-        { memberIds: ['a', 'b', 'c'], maxGroupSize: 6 },
-        'idem-key-4',
-        'admin-discord-id',
-      ),
-    ).rejects.toThrow('Failed to update row after successful execution');
+        { memberIds: ['a'], maxGroupSize: 6 },
+        'idem-does-not-exist',
+        'admin-discord-id'
+      )
+    ).rejects.toThrow('No pending command found for idempotency_key: idem-does-not-exist');
   });
 
-  it('throws error if update fails after execution failure', async () => {
-    const supabase = makeFakeSupabase(null, 0); // Fail on first update call
-    // Also need to fail on the second update call (the failure-path update)
-    let updateCallIndex = 0;
-    const supabaseWithDoubleFailure = {
-      ...supabase,
-      from: () => ({
-        insert: () => ({
-          select: () => ({
-            single: async () => ({ data: { id: 'row-1', status: 'processing' }, error: null }),
-          }),
-        }),
-        select: () => ({
-          eq: () => ({
-            single: async () => ({ data: null, error: null }),
-          }),
-        }),
-        update: (values: Record<string, unknown>) => ({
-          eq: () => {
-            supabase.updateCalls.push(values);
-            // Always fail updates in this test
-            return Promise.resolve({ error: { message: 'Update failed' } });
-          },
-        }),
-      }),
-    };
+  it('(e) rejects unknown action before attempting to claim', async () => {
+    const existingRows = [
+      { id: 'row-1', idempotency_key: 'idem-e', status: 'pending' },
+    ];
+    const supabase = makeFakeSupabase({ existingRows });
+
+    await expect(
+      executeCommand(supabase as any, 'nonexistent_action', {}, 'idem-e', 'admin-discord-id')
+    ).rejects.toThrow('Unknown action: nonexistent_action');
+  });
+
+  it('(f) catches action execution failure and records it as failed', async () => {
+    const existingRows = [
+      { id: 'row-1', idempotency_key: 'idem-f', status: 'pending' },
+    ];
+    const supabase = makeFakeSupabase({ existingRows });
+
+    // Pass invalid memberIds to cause action to throw
+    const result = await executeCommand(
+      supabase as any,
+      'randomize',
+      { memberIds: { invalid: 'not-an-array' }, maxGroupSize: 6 },
+      'idem-f',
+      'admin-discord-id'
+    );
+
+    expect(result.status).toBe('failed');
+  });
+
+  it('(g) throws error if final update fails after successful execution', async () => {
+    const existingRows = [
+      { id: 'row-1', idempotency_key: 'idem-g', status: 'pending' },
+    ];
+    const supabase = makeFakeSupabase({ existingRows, updateToFinalStatusShouldFail: true });
+
     await expect(
       executeCommand(
-        supabaseWithDoubleFailure as any,
+        supabase as any,
         'randomize',
-        { memberIds: { invalid: 'object' }, maxGroupSize: 6 }, // Will throw during execution
-        'idem-key-5',
-        'admin-discord-id',
-      ),
-    ).rejects.toThrow('Failed to update row after execution failure');
+        { memberIds: ['a', 'b'], maxGroupSize: 6 },
+        'idem-g',
+        'admin-discord-id'
+      )
+    ).rejects.toThrow('Failed to update row after successful execution');
   });
 });

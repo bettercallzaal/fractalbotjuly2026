@@ -1,11 +1,11 @@
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { RealtimeChannel, SupabaseClient } from '@supabase/supabase-js';
 import { executeCommand } from './executeCommand.js';
 
 /** Listens for new rows in bot_commands and executes them. Only reacts to
  * status='pending' inserts - rows inserted directly as 'processing' (e.g.
  * by the HTTP fallback racing ahead) are left alone since executeCommand's
  * own dedupe already claimed them. */
-export function subscribeToCommands(supabase: SupabaseClient) {
+export function subscribeToCommands(supabase: SupabaseClient): RealtimeChannel {
   return supabase
     .channel('bot_commands_listener')
     .on(
