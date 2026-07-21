@@ -8,6 +8,7 @@ import {
 } from '../lib/discordPresence.js';
 import { buildRoster, type PresenceSignal, type RegistryEntry } from '../lib/rosterCapture.js';
 import { fetchFarcasterProfiles } from '../lib/farcaster.js';
+import { makeOptimismClient, readOrecConfig, readProposalStatus } from '../lib/governance.js';
 import {
   indexIdentities,
   type RespectMemberRow,
@@ -340,6 +341,54 @@ const ACTIONS: Record<
 
     const profiles = await fetchFarcasterProfiles(fids);
     return { profiles: [...profiles.values()] };
+  },
+
+  /** Governance awareness: read ZAO's live OREC contract on Optimism. Returns
+   * the real governance parameters (voting/veto window lengths, minimum weight
+   * to pass, the vote-weight token, the executor owner), and optionally the
+   * live stage + vote status of a specific proposal (`propId`). Read-only,
+   * on-chain, no ornode config needed. */
+  governanceAwareness: async (params) => {
+    const client = makeOptimismClient();
+    const config = await readOrecConfig(client);
+    const propId = params.propId as string | undefined;
+    const proposal =
+      propId && /^0x[0-9a-fA-F]{64}$/.test(propId)
+        ? await readProposalStatus(client, propId as `0x${string}`)
+        : undefined;
+    return { config, proposal };
+  },
+
+  /** Farcaster posting - the write half of the integration, reusing @zolbot's
+   * identity (FARCASTER_BOT_FID). DRAFT-ONLY and human-gated by design: it
+   * records the intended cast in `discord_bot_events` (event_type
+   * 'farcaster_draft') and returns it for review. It never submits to the
+   * Farcaster hub - approving + publishing a draft is a deliberate, separate
+   * step (same gate ZOL uses). This keeps the bot from ever auto-posting. */
+  draftCast: async (params, ctx) => {
+    const text = params.text as string | undefined;
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      throw new Error('draftCast requires non-empty `text`');
+    }
+    if (text.length > 1024) {
+      throw new Error('draftCast text exceeds Farcaster 1024-byte cast limit');
+    }
+    const fid = Number(process.env.FARCASTER_BOT_FID ?? 0) || null;
+    const draft = {
+      text: text.trim(),
+      fid,
+      reason: (params.reason as string | undefined) ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    // Record the draft as an awareness event so it surfaces on the dashboard
+    // for human approval. Best-effort; the draft is still returned on failure.
+    const { error } = await ctx.supabase.from('discord_bot_events').insert({
+      event_type: 'farcaster_draft',
+      detail: draft,
+      created_at: draft.createdAt,
+    });
+    if (error) console.error('draftCast: failed to record draft', error.message);
+    return { status: 'drafted', draft, note: 'Not posted. Approve + publish separately (human-gated).' };
   },
 };
 
