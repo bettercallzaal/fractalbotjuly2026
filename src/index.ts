@@ -3,6 +3,8 @@ import { Client, Events, GatewayIntentBits } from 'discord.js';
 import { getSupabaseClient } from './lib/supabaseClient.js';
 import { subscribeToCommands } from './commands/subscribeToCommands.js';
 import { createHttpServer } from './http/server.js';
+import { startVoiceTracker } from './awareness/voiceTracker.js';
+import { startHeartbeat } from './awareness/heartbeat.js';
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -32,6 +34,17 @@ client.once(Events.ClientReady, (readyClient) => {
   const supabase = getSupabaseClient();
   subscribeToCommands(supabase, readyClient);
   console.log('Subscribed to bot_commands');
+
+  // Awareness layer (passive): the bot now watches the room and records it.
+  const trackedVoice = (process.env.FRACTAL_VOICE_CHANNEL_IDS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  startVoiceTracker(client, supabase, trackedVoice);
+  startHeartbeat(client, supabase);
+  console.log(
+    `Awareness active: voice tracker (${trackedVoice.length ? trackedVoice.length + ' tracked channel(s)' : 'all channels'}) + heartbeat`,
+  );
 
   const port = Number(process.env.HTTP_PORT ?? 8080);
   createHttpServer(supabase, apiSecret).listen(port, () => {
