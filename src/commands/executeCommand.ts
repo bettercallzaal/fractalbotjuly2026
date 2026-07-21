@@ -1,13 +1,58 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { type Member, resolveRoster } from '../lib/nameResolver.js';
 import { distributeIntoGroups } from './randomize.js';
 
 type ActionResult = { status: 'done' | 'failed' | 'already_processed'; result?: unknown };
 
-const ACTIONS: Record<string, (params: Record<string, unknown>) => unknown> = {
+/** Action runner context. Actions that only transform their params ignore it
+ * (e.g. randomize); actions that read state use `ctx.supabase`. */
+interface ActionContext {
+  supabase: SupabaseClient;
+}
+
+const ACTIONS: Record<
+  string,
+  (params: Record<string, unknown>, ctx: ActionContext) => unknown | Promise<unknown>
+> = {
   randomize: (params) => {
     const memberIds = params.memberIds as string[];
     const maxGroupSize = params.maxGroupSize as number;
     return { groups: distributeIntoGroups(memberIds, maxGroupSize) };
+  },
+
+  /** Resolve a roster of raw Discord display names to Respect members
+   * (name + wallet), so a fractal's scoring writes to the right rows.
+   * Returns matched / ambiguous / unmatched so the caller can score the
+   * clean matches, prompt a human on the ambiguous ones, and register the
+   * unmatched. Reads the shared `respect_members` table. */
+  resolveMembers: async (params, ctx) => {
+    const names = params.names as string[];
+    if (!Array.isArray(names)) {
+      throw new Error('resolveMembers requires a `names` string array');
+    }
+    const { data, error } = await ctx.supabase
+      .from('respect_members')
+      .select('name, wallet_address, fid');
+    if (error) throw error;
+    const members = (data ?? []) as Member[];
+    const resolution = resolveRoster(names, members);
+    return {
+      matched: resolution.matched.map((m) => ({
+        query: m.query,
+        name: m.member?.name ?? null,
+        wallet: m.member?.wallet_address ?? null,
+        fid: m.member?.fid ?? null,
+        confidence: m.confidence,
+      })),
+      ambiguous: resolution.ambiguous.map((m) => ({
+        query: m.query,
+        candidates: (m.candidates ?? []).map((c) => ({
+          name: c.name,
+          wallet: c.wallet_address,
+        })),
+      })),
+      unmatched: resolution.unmatched,
+    };
   },
 };
 
@@ -65,10 +110,11 @@ export async function executeCommand(
     throw claimError;
   }
 
-  // Successfully claimed the row - now run the action.
+  // Successfully claimed the row - now run the action. `await` handles both
+  // sync actions (randomize) and async ones (resolveMembers, which reads the DB).
   let result: unknown;
   try {
-    result = runner(params);
+    result = await runner(params, { supabase });
   } catch (err) {
     // Runner threw - update row with failure status and re-throw the error
     // after recording it in the database.
