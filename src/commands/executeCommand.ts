@@ -9,6 +9,7 @@ import {
 import { buildRoster, type PresenceSignal, type RegistryEntry } from '../lib/rosterCapture.js';
 import { fetchFarcasterProfiles } from '../lib/farcaster.js';
 import { makeOptimismClient, readOrecConfig, readProposalStatus } from '../lib/governance.js';
+import { findEntry, listTopics } from '../lib/fractalKnowledge.js';
 import {
   indexIdentities,
   type RespectMemberRow,
@@ -389,6 +390,42 @@ const ACTIONS: Record<
     });
     if (error) console.error('draftCast: failed to record draft', error.message);
     return { status: 'drafted', draft, note: 'Not posted. Approve + publish separately (human-gated).' };
+  },
+
+  /** Serve the fractal's documentation in Discord. Given a `topic`, returns the
+   * matching knowledge-base entry (what the fractal is, Respect, the game,
+   * scoring, governance with live-verified numbers, the two ledgers, contracts,
+   * running a fractal, the roadmap). With no topic - or an unrecognized one -
+   * returns the list of topics a member can ask about. Pure, no reads. This is
+   * the consolidated fractal documentation, carried inside the bot. */
+  explain: (params) => {
+    const topic = (params.topic as string | undefined)?.trim();
+    const topics = listTopics();
+
+    if (!topic || /^(list|help|topics|\?)$/i.test(topic)) {
+      return {
+        kind: 'topics',
+        prompt: 'Ask me about the fractal. Topics:',
+        topics,
+      };
+    }
+
+    const entry = findEntry(topic);
+    if (!entry) {
+      return {
+        kind: 'not_found',
+        message: `No fractal topic matches "${topic}". Try one of these:`,
+        topics,
+      };
+    }
+
+    return {
+      kind: 'entry',
+      key: entry.key,
+      title: entry.title,
+      body: entry.body,
+      related: entry.see.map((k) => topics.find((t) => t.key === k)).filter(Boolean),
+    };
   },
 };
 
